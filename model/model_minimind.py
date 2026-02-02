@@ -374,18 +374,53 @@ class MiniMindBlock(nn.Module):
 
 
 class MiniMindModel(nn.Module):
+    """
+    MiniMind 的 **Transformer 主干（backbone）**。
+
+    作用（新手版）：
+    - 输入：`input_ids`（token id 序列，形状 [B, T]）
+    - 输出：`hidden_states`（每个 token 的隐藏表示，形状 [B, T, H]）
+    - 同时支持：
+      - **KV cache**（`past_key_values` / `presents`）：加速自回归生成
+      - **MoE 辅助损失**（`aux_loss`）：仅当 config.use_moe=True 时有意义
+
+    注意：
+    - 这个类 **不负责** 把 hidden_states 映射到词表 logits，也 **不负责** 计算语言模型的 CE loss；
+      这些由上层的 `MiniMindForCausalLM`（加了 `lm_head`）来做。
+    """
     def __init__(self, config: MiniMindConfig):
         super().__init__()
+        # 保存 config（里面包含 hidden_size、层数、头数、词表大小、RoPE 参数、是否 MoE 等）
         self.config = config
+
+        # 常用的快捷属性
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+
+        # token embedding：把 token id（整数）映射为向量
+        # embed_tokens.weight 形状是 [V, H]
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+        # dropout：训练时随机失活；推理时会自动关闭（self.training=False）
         self.dropout = nn.Dropout(config.dropout)
+
+        # 多层 Transformer block（每层：Attention + MLP/MoE + 残差 + Norm）
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+
+        # 输出前的最终归一化（Llama 系常用 RMSNorm）
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # ---------------------------
+        # RoPE（旋转位置编码）预计算表
+        # ---------------------------
+        # 这里预先计算出 [max_position_embeddings, head_dim] 的 cos/sin 表，
+        # forward 时根据当前序列位置切片取用，避免每次都现算。
+        # head_dim = hidden_size / num_attention_heads
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, rope_base=config.rope_theta,
                                                     rope_scaling=config.rope_scaling)
+
+        # register_buffer：这些张量不是“可训练参数”（不参与梯度），但希望跟着模型一起搬到 GPU/CPU
+        # persistent=False：通常不把这类可再生成的缓存写入权重文件（省体积）
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
@@ -395,18 +430,50 @@ class MiniMindModel(nn.Module):
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 **kwargs):
+        """
+        参数：
+        - **input_ids**: [B, T] token id
+        - **attention_mask**: [B, T]（可选）1=有效 token，0=padding（在 slow attention 路径会用于 mask）
+        - **past_key_values**: List[(K, V)]（可选）用于 KV cache
+            - 每层一个 (K, V)，其中 K/V 的形状大致为 [B, T_cached, n_kv_heads, head_dim]
+        - **use_cache**: True 时返回新的 `presents`，供下一步生成复用
+
+        返回：
+        - **hidden_states**: [B, T, H]
+        - **presents**: List[(K, V)]（若 use_cache=False，里面会是 None）
+        - **aux_loss**: MoE 辅助损失（非 MoE 时为 0）
+        """
+
+        # 当前 batch 的序列长度
         batch_size, seq_length = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
+
+        # 兼容一些 HF 生成流程里传入的 cache 对象（可能带 layers 属性）
+        # 本实现只接受 List[(K,V)] 的形式；不匹配就清掉让其重新生成
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None
+
+        # past_key_values 对齐层数：没传就用 [None, None, ...]
         past_key_values = past_key_values or [None] * len(self.layers)
+
+        # start_pos：当前这段 token 在“整条生成序列”里的起始位置
+        # - 如果有缓存，缓存的长度就是历史 token 数 = T_cached
+        # - RoPE 需要知道绝对/连续位置，所以切片 cos/sin 时要从 start_pos 开始
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
+        # 1) token embedding + dropout
+        # hidden_states: [B, T, H]
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
+        # 2) 构造本段序列对应的 RoPE cos/sin（长度为 T）
+        # position_embeddings: (cos, sin)
+        # - cos/sin: [T, head_dim]（实现里是按 dim 拼接后的形状，供 attention 内部广播使用）
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_length],
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
 
+        # 3) 逐层前向
+        # presents：收集每一层的 KV cache（用于下一次生成）
         presents = []
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
             hidden_states, present = layer(
@@ -418,20 +485,48 @@ class MiniMindModel(nn.Module):
             )
             presents.append(present)
 
+        # 4) 最后一层 norm
         hidden_states = self.norm(hidden_states)
 
+        # 5) MoE 辅助损失汇总
+        # - 只有当某些层的 mlp 是 MOEFeedForward 时，才会在该层 forward 时设置 mlp.aux_loss
+        # - 非 MoE 模式下，这里返回 0（同 device/dtype）
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+
+        # 返回主干输出 + KV cache + MoE aux loss
         return hidden_states, presents, aux_loss
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    """
+    一个“可生成”的因果语言模型（Causal LM）封装：
+
+    - **MiniMindModel**：负责把 `input_ids` 编码成每个位置的隐藏状态 `hidden_states`（形状通常是 [B, T, H]）
+    - **lm_head**：把隐藏状态线性映射到词表维度，得到每个位置对“下一个 token”的预测分布 logits（形状通常是 [B, T, V]）
+    - **GenerationMixin**：让这个模型能直接调用 HuggingFace 的 `generate()` 进行推理生成
+
+    你可以把它理解成：**Transformer 主干 + 输出头（词表分类器）+ 生成接口**。
+    """
     config_class = MiniMindConfig
 
     def __init__(self, config: MiniMindConfig = None):
+        # config：模型的“超参数集合”（层数、隐藏维度、头数、词表大小、dropout、是否 MoE 等）
         self.config = config or MiniMindConfig()
+
+        # 初始化 HuggingFace 的 PreTrainedModel（会登记 config、提供保存/加载、权重初始化钩子等能力）
         super().__init__(self.config)
+
+        # Transformer 主体：输入 token id -> hidden_states（每个位置的表示）
         self.model = MiniMindModel(self.config)
+
+        # 语言模型输出头：hidden_size -> vocab_size
+        # - bias=False：常见做法，配合“权重共享”更干净
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+
+        # 权重共享（weight tying）：
+        # - embed_tokens: 词嵌入矩阵 [V, H]
+        # - lm_head.weight: 输出头权重 [V, H]
+        # 共享后可减少参数量，并在很多 LM 中提升/稳定训练效果。
         self.model.embed_tokens.weight = self.lm_head.weight
 
     def forward(self,
@@ -442,6 +537,25 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
+        """
+        前向传播（训练/推理通用）。
+
+        参数含义（新手版）：
+        - **input_ids**: [B, T]，每个位置是一个 token 的 id
+        - **attention_mask**: [B, T]，1 表示有效 token，0 表示 padding（本实现主要在非 flash 路径参与 mask）
+        - **labels**: [B, T]，训练时用来算 loss；通常是 input_ids 的“右移版本”，padding 位置会设为 -100
+        - **past_key_values**: 用于 KV cache，加速自回归生成；每层缓存 (K, V)
+        - **use_cache**: 是否返回新的 KV cache（生成时一般 True）
+        - **logits_to_keep**:
+            - int：只保留最后 k 个位置的 logits（推理时省显存/算力常用）
+            - Tensor：更灵活的索引（比如只取某些位置）
+          注意：**训练计算 loss 时必须要和 labels 的长度对齐**，否则会形状不匹配。
+        """
+
+        # 1) 先跑 Transformer 主体，得到每个位置的隐藏状态
+        # hidden_states: [B, T, H]
+        # past_key_values: List[(K, V)]，每层的 KV cache（若 use_cache=True）
+        # aux_loss: MoE 的辅助损失（非 MoE 时通常为 0）
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -449,15 +563,35 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         )
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+
+        # 2) 决定要输出哪些位置的 logits
+        # - 推理生成时，经常只需要最后 1 个位置的 logits（预测下一个 token）
+        # - 训练算 loss 时，需要覆盖整段序列以与 labels 对齐，所以这里强制不裁剪
+        if labels is not None:
+            slice_indices = slice(None)  # 保留全部时间步，避免与 labels 长度不一致
+        else:
+            # logits_to_keep=0 时，-0 等于 0，所以 slice(0, None) 等价于“保留全部”
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+
+        # 3) 线性映射到词表维度，得到 logits
+        # logits: [B, T', V]（T' 可能是 T，也可能是裁剪后的长度）
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
+            # 4) 训练 loss（自回归 next-token prediction）
+            # 约定：用第 t 个位置的 logits 去预测 labels 的第 t+1 个 token
+            # - shift_logits: 去掉最后一个时间步，因为它没有“下一个 token”可预测
+            # - shift_labels: 去掉第一个 label，让两者对齐
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+
+            # 交叉熵：把 [B, T-1, V] 展平成 [(B*(T-1)), V]；labels 展平成 [(B*(T-1))]
+            # ignore_index=-100：常用于跳过 padding/不计入 loss 的位置
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
+        # 5) 按 HuggingFace 的标准输出结构返回（方便 trainer/generate 等复用）
         output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+        # 额外挂一个 MoE 辅助损失（上层训练脚本可按需加到总 loss 里）
         output.aux_loss = aux_loss
         return output
